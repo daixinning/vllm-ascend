@@ -170,6 +170,12 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE",
             ascend_envs.VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE,
         )
+        self.enable_matmul_reduce_scatter = self._get_config_value(
+            additional_config,
+            "enable_matmul_reduce_scatter",
+            "VLLM_ASCEND_ENABLE_MATMUL_REDUCE_SCATTER",
+            ascend_envs.VLLM_ASCEND_ENABLE_MATMUL_REDUCE_SCATTER,
+        )
         self.enable_fused_mc2 = self._get_config_value(
             additional_config,
             "enable_fused_mc2",

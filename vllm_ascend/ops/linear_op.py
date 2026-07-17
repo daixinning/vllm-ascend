@@ -63,6 +63,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.parallel_state import (
+    get_ccu_sched_group,
     get_flashcomm2_odp_group,
     get_flashcomm2_otp_group,
     get_mlp_tp_group,
@@ -70,14 +71,17 @@ from vllm_ascend.distributed.parallel_state import (
 )
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import (
+    AscendDeviceType,
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
     enable_sp,
     flashcomm2_enable,
+    get_ascend_device_type,
     get_flashcomm2_reorgnized_batch_ids,
     get_weight_prefetch_method,
     is_vl_model,
     matmul_allreduce_enable,
+    matmul_reduce_scatter_enable,
     mlp_tp_enable,
     oproj_tp_enable,
     shared_expert_dp_enabled,
@@ -550,19 +554,49 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             return tensor_model_parallel_all_reduce(output_parallel)
 
+        # Gate the fused matmul+reduce_scatter to prefill-sized inputs only: the
+        # fused RS collective cannot allocate its comm resource inside decode
+        # cudagraph capture. matmul_and_reduce is a custom op (opaque to
+        # torch.compile) so this runtime shape gate is not baked into the graph.
+        mmrs_fusion = mmrs_fusion and input_parallel.shape[0] > 1000
+
         pad_size = _EXTRA_CTX.pad_size
         dsa_cp_attn_out = enable_dsa_cp() and ("o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix)
         if pad_size > 0 and not dsa_cp_attn_out:
             x = F.pad(x, (0, 0, 0, pad_size))
 
         world_size = self.layer.tp_size
-        comm_mode = "aiv"
-        hcom_name = get_tp_group().device_group._get_backend(torch.device("npu")).get_hccl_comm_name(self.layer.tp_rank)
+        soc_version = get_ascend_device_type()
+        # MC2 Matmul+ReduceScatter fusion on A5 (feature gate:
+        # enable_matmul_reduce_scatter). A5 quant RS requires comm_mode
+        # ccu/ai_cpu (None -> EZ0024) and the AICPU comm channel provisioned by
+        # the ccu_sched group (built with hccl_op_expansion_mode=6); the plain
+        # TP group fails channel init (RunAicpuIndOpChannelInitV2) in profile_run.
+        a5_rs_fusion = (
+            mmrs_fusion and soc_version == AscendDeviceType.A5 and matmul_reduce_scatter_enable()
+        )
+        if a5_rs_fusion:
+            comm_mode = "ai_cpu"
+            hcom_name = (
+                get_ccu_sched_group()
+                .device_group._get_backend(torch.device("npu"))
+                .get_hccl_comm_name(self.layer.tp_rank)
+            )
+        else:
+            comm_mode = "aiv"
+            hcom_name = (
+                get_tp_group()
+                .device_group._get_backend(torch.device("npu"))
+                .get_hccl_comm_name(self.layer.tp_rank)
+            )
 
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
         from vllm_ascend.quantization.method_adapters import AscendLinearMethod
-        from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
+        from vllm_ascend.quantization.methods import (
+            AscendW8A8LinearMethod,
+            AscendW8A8MXFP8DynamicLinearMethod,
+        )
 
         # For unquant
         if mmrs_fusion and isinstance(self.layer.quant_method, UnquantizedLinearMethod):
@@ -595,19 +629,62 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             quant_bias = self.layer.quant_bias
             deq_scale = self.layer.deq_scale
             output_dtype = torch.bfloat16
-            output = torch_npu.npu_mm_reduce_scatter_base(
-                x_quant,
+            if a5_rs_fusion:
+                output, _ = torch_npu.npu_quant_mm_reduce_scatter(
+                    x_quant,
+                    self.layer.weight,
+                    hcom_name,
+                    world_size,
+                    reduce_op="sum",
+                    bias=None,
+                    comm_turn=0,
+                    x2_scale=deq_scale,
+                    y_dtype=output_dtype,
+                    comm_mode=comm_mode,
+                )
+            else:
+                output = torch_npu.npu_mm_reduce_scatter_base(
+                    x_quant,
+                    self.layer.weight,
+                    hcom_name,
+                    world_size,
+                    reduce_op="sum",
+                    bias=None,
+                    comm_turn=0,
+                    x2_scale=deq_scale,
+                    output_dtype=output_dtype,
+                    comm_mode=comm_mode,
+                )
+            output = torch.add(output, torch.mul(quant_bias, deq_scale).to(self.layer.params_dtype))
+        # For mxfp8 (W8A8_MXFP8) quant -- A5 only, fused quant reduce_scatter (AICPU).
+        elif (
+            a5_rs_fusion
+            and isinstance(self.layer.quant_method, AscendLinearMethod)
+            and isinstance(self.layer.quant_method.quant_method, AscendW8A8MXFP8DynamicLinearMethod)
+        ):
+            from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
+
+            group_size = self.layer.quant_method.quant_method.group_size
+            quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+            output_dtype = torch.bfloat16
+            output, _ = torch_npu.npu_quant_mm_reduce_scatter(
+                quantized_x,
                 self.layer.weight,
                 hcom_name,
                 world_size,
                 reduce_op="sum",
                 bias=None,
+                x1_scale=pertoken_scale,
+                x2_scale=self.layer.weight_scale,
+                group_sizes=[1, 1, group_size],
+                x1_scale_dtype=int(FLOAT8_E8M0FNU_DTYPE),
+                x2_scale_dtype=int(FLOAT8_E8M0FNU_DTYPE),
                 comm_turn=0,
-                x2_scale=deq_scale,
-                output_dtype=output_dtype,
+                y_dtype=output_dtype,
                 comm_mode=comm_mode,
             )
-            output = torch.add(output, torch.mul(quant_bias, deq_scale).to(self.layer.params_dtype))
+            if bias_ is not None:
+                output.add_(bias_.to(output.dtype))
         else:
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
