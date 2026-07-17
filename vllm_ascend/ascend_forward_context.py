@@ -131,7 +131,13 @@ def set_ascend_forward_context(
             # Disable it to avoid more problems.
             flash_comm_v1_enabled = False
         else:
-            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+            # Drop the num_tokens>1000 gate: torch.compile traces the SP all_gather
+            # (xTP) ONCE at profile_run (>1000 -> True); both compile ranges inherit
+            # that baked topology, so decode replay at small tokens hits [40] vs [20]
+            # (verified: stock gate crashes in acl_graph replay, src[40,5120] vs
+            # slice[20,5120]). Keeping flash_comm always-on (= enable_sp, like the MoE
+            # branch above) aligns trace with every runtime forward; cudagraph-safe.
+            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
         forward_context.mmrs_fusion = mmrs_fusion
         forward_context.num_tokens = num_tokens
         forward_context.flash_comm_v1_enabled = flash_comm_v1_enabled
