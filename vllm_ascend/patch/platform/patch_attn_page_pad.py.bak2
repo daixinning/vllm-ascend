@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# This file is a part of the vllm-ascend project.
+#
+
+"""给 AttentionSpec 注入 page_size_padded，配合 VLLM_ASCEND_TARGET_BLOCK_SIZE。
+
+强制小 block_size 时，attention 的 real page (block*K+V) 会小于 mamba page。
+KVCacheManager 只能管理单一 page 大小，upstream 的 unify_kv_cache_spec_page_size()
+会通过**抬高 block_size** 来对齐，正好抵消我们要的小 block。
+这里改为把 attention 的 page 显式 pad 到共同值，unify 看到两边相等即直接返回。
+
+allocation 侧无需改动：worker/gpu/attn_utils.py 见到 page_size_padded 就会用
+torch.as_strided 以 padded page 为 block 跨步建视图，每个 block 内部布局不变。
+"""
+import os
+
+from vllm.logger import logger
+from vllm.model_executor.layers.attention.attention import Attention
+
+_orig_get_kv_cache_spec = Attention.get_kv_cache_spec
+
+
+def _patched_get_kv_cache_spec(self, vllm_config):
+    spec = _orig_get_kv_cache_spec(self, vllm_config)
+    padded = os.environ.get("_VLLM_ASCEND_ATTN_PAGE_PADDED")
+    if not padded or spec is None:
+        return spec
+    padded = int(padded)
+    real = spec.page_size_bytes
+    if padded > real:
+        # frozen dataclass，用 object.__setattr__（upstream 在
+        # kv_cache_utils.py:1572 也是这么做的）
+        object.__setattr__(spec, "page_size_padded", padded)
+        logger.info_once(
+            "Padding attention page %d -> %d B (x%.2f) so it matches the mamba "
+            "page, keeping block_size=%d instead of letting unify raise it.",
+            real,
+            padded,
+            padded / real,
+            spec.block_size,
+        )
+    return spec
+
+
+Attention.get_kv_cache_spec = _patched_get_kv_cache_spec

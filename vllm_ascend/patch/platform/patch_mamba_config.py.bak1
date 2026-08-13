@@ -92,13 +92,11 @@ def verify_and_update_config(cls, vllm_config) -> None:
         attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
 
     # 推导 attn_block_size 的基准页大小。
-    # 原始实现用 K-only 页(attn_single_token_k_page_size)，但下游 padding 用的是
-    # K+V 页(attn_token_page_size)，两处不自洽 —— 结果 mamba slot 被 pad 到实际需要的
-    # 约 2 倍，且 block_size 比必要值大一倍(本模型 2048 vs 1024)，白白粗化了
-    # prefix cache 的复用粒度。改按 K+V 推导后 padding 恰好等于 ssm+conv(零浪费)。
-    #
-    # 注意: 本文件在 /mnt/share 共享挂载上，可能被他人使用，故**默认保持原行为**。
-    # 需要新行为时显式设 VLLM_ASCEND_MAMBA_BLOCK_BY_KV=1。
+    # 默认(VLLM_ASCEND_MAMBA_BLOCK_BY_KV=1)用 K+V 每 token 页大小，与下游
+    # padding(attn_page_size = block_size * attn_token_page_size)保持一致，
+    # 使 mamba_page_size_padded 恰好等于 ssm+conv（零浪费），block_size 相应减半，
+    # prefix cache 复用粒度同比变细。
+    # 置 0 回退为原来的 K-only 推导。
     import os as _os
 
     _by_kv = _os.environ.get("VLLM_ASCEND_MAMBA_BLOCK_BY_KV", "0") == "1"
@@ -106,23 +104,25 @@ def verify_and_update_config(cls, vllm_config) -> None:
 
     attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * _base_page)
     assert _base_page * attn_block_size == ssm_block_page_size, (
-        f"Cannot align ssm_page_size and attn_page_size. ssm={ssm_block_page_size} "
-        f"base_page={_base_page} block={attn_block_size} (by_kv={_by_kv}); "
-        f"该模型无法整除，请置 VLLM_ASCEND_MAMBA_BLOCK_BY_KV=0 回退。"
+        f"Cannot align ssm_page_size and attn_page_size. "
+        f"ssm={ssm_block_page_size} base_page={_base_page} block={attn_block_size} "
+        f"(by_kv={_by_kv}); 该模型无法整除，请置 VLLM_ASCEND_MAMBA_BLOCK_BY_KV=0 回退。"
     )
     logger.info(
         "mamba/attn block alignment: base_page=%d B (%s), ssm=%d B -> attn_block_size=%d",
-        _base_page, "K+V" if _by_kv else "K-only", ssm_block_page_size, attn_block_size,
+        _base_page,
+        "K+V" if _by_kv else "K-only",
+        ssm_block_page_size,
+        attn_block_size,
     )
 
     # override attention block size if either (a) the
     # user has not set it or (b) the user has set it
     # too small.
-    # 强制小 block_size（VLLM_ASCEND_TARGET_BLOCK_SIZE，不设则无影响）。
-    # mamba state 原子且 >= 2 MiB，不能随 block 缩小；KVCacheManager 要求各 group
-    # page 相同，unify_kv_cache_spec_page_size() 会抬高 block_size 来对齐。
-    # 所以反过来把 attention 的 page pad 到与 mamba 一致（由 patch_attn_page_pad 注入
-    # AttentionSpec.page_size_padded），从而守住小 block。代价是 KV cache 容量下降。
+    # ---- 强制小 block_size（VLLM_ASCEND_TARGET_BLOCK_SIZE） ----
+    # mamba state 原子且 >= 2,146,304 B，无法随 block 缩小；因此不靠降 block
+    # 去缩 page，而是把 attention 的 page pad 到与 mamba 相同，
+    # 让 unify_kv_cache_spec_page_size() 认为两者已一致、不再抬 block_size。
     _target = _os.environ.get("VLLM_ASCEND_TARGET_BLOCK_SIZE")
     if _target:
         _target = int(_target)
@@ -132,15 +132,35 @@ def verify_and_update_config(cls, vllm_config) -> None:
             )
         _mamba_real = ssm_block_page_size + conv_block_page_size
         _attn_real = _target * attn_token_page_size
+        # common page 只需 >= 两者的 real page。as_strided 的 page_stride 是
+        # "padded_bytes // dtype_size" 个元素，只要 >= 单 block 实际元素数就不会重叠，
+        # 不需要凑成 attn_real 的整数倍（凑整会白付一档 padding：
+        # block256 5.00x -> 4.09x，block512 3.00x -> 2.05x）。
+        # VLLM_ASCEND_PAD_ROUND_UP=1 可退回凑整行为做对比。
         _common = max(_mamba_real, _attn_real)
+        if _os.environ.get("VLLM_ASCEND_PAD_ROUND_UP") == "1":
+            _common = _attn_real * cdiv(_common, _attn_real)
+
         cache_config.block_size = _target
-        cache_config.mamba_block_size = _target
+        # VLLM_ASCEND_TARGET_MAMBA_BLOCK 可让 mamba_block_size 与 block_size 解耦，
+        # 用于隔离 1024->512 的 TTFT 跳变来自 attention 侧还是 mamba 存档频率。
+        # 注意: 交集语义下命中粒度取两者中较粗的，所以解耦不提升命中率，仅供诊断。
+        _mblk = int(_os.environ.get("VLLM_ASCEND_TARGET_MAMBA_BLOCK", _target))
+        cache_config.mamba_block_size = _mblk
         cache_config.mamba_page_size_padded = _common
+        # 供 patch_attn_page_pad 注入到 AttentionSpec
         _os.environ["_VLLM_ASCEND_ATTN_PAGE_PADDED"] = str(_common)
+
         logger.info(
-            "FORCED block_size=%d. common_page=%d B: attn real=%d -> padded x%.2f, mamba real=%d. "
+            "FORCED block_size=%d (mamba_block_size=%d). "
+            "common_page=%d B: attn real=%d -> padded x%.2f, mamba real=%d. "
             "KV cache 容量会相应下降。",
-            _target, _common, _attn_real, _common / _attn_real, _mamba_real,
+            _target,
+            _mblk,
+            _common,
+            _attn_real,
+            _common / _attn_real,
+            _mamba_real,
         )
         return
 

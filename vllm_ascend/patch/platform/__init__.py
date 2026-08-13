@@ -26,6 +26,7 @@ from vllm_ascend.utils import is_310p, vllm_version_is
 
 if not is_310p():
     import vllm_ascend.patch.platform.patch_mamba_config  # noqa
+    import vllm_ascend.patch.platform.patch_attn_page_pad  # noqa
 else:
     import vllm_ascend.patch.platform.patch_mamba_config_310  # noqa
 import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
