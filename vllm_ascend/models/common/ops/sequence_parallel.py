@@ -101,6 +101,64 @@ def sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.vllm.ascend_sp_reduce_scatter_impl(x)
 
 
+def _ascend_mm_reduce_scatter_padded_impl(
+    x: torch.Tensor,
+    x2: torch.Tensor,
+    hcom: str,
+    tp_size: int,
+) -> torch.Tensor:
+    """Pad the GEMM input rows to the TP multiple, then fuse matmul with reduce-scatter.
+
+    The fused counterpart of ``gemm -> sp_reduce_scatter``, used by the graph
+    rewrite in ``compilation/passes/mm_reduce_scatter_fusion_pass.py``. Padding
+    the bias-free GEMM input is equivalent to appending zero rows to its output,
+    and avoids materializing padding for the much larger output.
+
+    A custom op keeps the modulo padding invisible to dynamo (same shape-baking
+    hazard as ``sp_shard``): the pad depends on the dynamic token count, so an
+    inlined ``if sp_pad > 0`` would bake the trace-time value into a graph that
+    serves a whole range of token counts.
+
+    ``hcom`` and ``tp_size`` are passed in rather than read from the TP group
+    because the pattern replacement resolves them once at registration time.
+    """
+    from vllm_ascend.device.device_op import DeviceOperator
+
+    sp_pad = (-x.shape[0]) % tp_size
+    if sp_pad > 0:
+        x = F.pad(x, (0, 0, 0, sp_pad))
+    return DeviceOperator.npu_mm_reduce_scatter_base(x, x2, hcom, tp_size, reduce_op="sum")
+
+
+def _ascend_mm_reduce_scatter_padded_fake(
+    x: torch.Tensor,
+    x2: torch.Tensor,
+    hcom: str,
+    tp_size: int,
+) -> torch.Tensor:
+    # x is [m, k], x2 is the transposed weight [k, n]; the reduce-scatter splits rows.
+    return torch.empty(
+        [cdiv(x.shape[0], tp_size), x2.shape[1]],
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="ascend_mm_reduce_scatter_padded",
+    op_func=_ascend_mm_reduce_scatter_padded_impl,
+    mutates_args=[],
+    fake_impl=_ascend_mm_reduce_scatter_padded_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
+def mm_reduce_scatter_padded(x: torch.Tensor, x2: torch.Tensor, hcom: str, tp_size: int) -> torch.Tensor:
+    """Fused ``gemm -> sp_reduce_scatter``; see the impl for the padding contract."""
+    assert x.ndim == 2 and x2.ndim == 2
+    return torch.ops.vllm.ascend_mm_reduce_scatter_padded(x, x2, hcom, tp_size)
+
+
 def _ascend_sp_padding_mask_impl(is_padding: torch.Tensor) -> torch.Tensor:
     """Pad with True rows up to the TP multiple, then take this rank's chunk.
 

@@ -108,6 +108,11 @@ class HardwareCapability(Enum):
     GMM_DEQUANT_SITU_QUANT = auto()
     # Register the FX graph rewrite that fuses a supported matmul/reduce-scatter pattern.
     GRAPH_MM_REDUCE_SCATTER_FUSION = auto()
+    # Register the FX graph rewrites that fuse an MXFP8 quantized matmul with the adjacent
+    # sequence-parallel reduce-scatter or all-gather collective.
+    GRAPH_QUANT_MATMUL_COMM_FUSION = auto()
+    # Register the FX graph rewrite that fuses a supported matmul/all-reduce pattern.
+    GRAPH_MM_ALL_REDUCE_FUSION = auto()
     # Register the FX graph rewrite that fuses the supported muls-plus-add pattern.
     GRAPH_MULS_ADD_FUSION = auto()
     # Register the FX graph rewrites for supported RMSNorm-plus-quant patterns.
@@ -381,6 +386,8 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.FP8_ATTENTION,
                     HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
                     HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
+                    HardwareCapability.GRAPH_QUANT_MATMUL_COMM_FUSION,
+                    HardwareCapability.GRAPH_MM_ALL_REDUCE_FUSION,
                     HardwareCapability.GRAPH_MULS_ADD_FUSION,
                     HardwareCapability.GRAPH_NORM_QUANT_FUSION,
                     HardwareCapability.LOCAL_KV_COMM_RESOURCE,

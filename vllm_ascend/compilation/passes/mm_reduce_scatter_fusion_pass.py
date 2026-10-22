@@ -21,6 +21,11 @@ from vllm_ascend.compilation.passes import base_pattern
 from vllm_ascend.compilation.passes.base_pattern import BasePattern
 from vllm_ascend.device.device_op import DeviceOperator
 
+# Imported for its registration side effect: defines both
+# torch.ops.vllm.ascend_sp_reduce_scatter_impl (matched below) and
+# torch.ops.vllm.ascend_mm_reduce_scatter_padded (its fused replacement).
+from vllm_ascend.models.common.ops import sequence_parallel as _sequence_parallel  # noqa: F401
+
 _MIN_REDUCE_DIM = 256
 _MAX_REDUCE_DIM_EXCLUSIVE = 65535
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
@@ -28,6 +33,7 @@ _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 
 _GEMM_OP = torch.ops.vllm.unquantized_gemm.default
 _REDUCE_SCATTER_OP = torch.ops.vllm.reduce_scatter.default
+_ASCEND_SP_REDUCE_SCATTER_OP = torch.ops.vllm.ascend_sp_reduce_scatter_impl.default
 _PAD_OP = torch.ops.aten.constant_pad_nd.default
 _CAT_OP = torch.ops.aten.cat.default
 _FULL_OP = torch.ops.aten.full.default
@@ -88,13 +94,26 @@ class _MatmulReduceScatterPattern(BasePattern):
         )
         base_pattern._registered_patterns.add(pattern_id)
 
+    @staticmethod
+    def _check_gemm(gemm: fx.Node) -> bool:
+        if _arg(gemm, 2, "bias") is not None:
+            return False
+        x, weight = gemm.args[0], gemm.args[1]
+        if not isinstance(x, fx.Node) or not isinstance(weight, fx.Node):
+            return False
+        x_val, weight_val = x.meta.get("val"), weight.meta.get("val")
+        if x_val is None or weight_val is None or x_val.dim() != 2 or weight_val.dim() != 2:
+            return False
+        if x_val.dtype not in _SUPPORTED_DTYPES or x_val.dtype != weight_val.dtype:
+            return False
+        reduce_dim = _static_int(x_val.shape[1])
+        return reduce_dim is not None and _MIN_REDUCE_DIM <= reduce_dim < _MAX_REDUCE_DIM_EXCLUSIVE
+
     def _get_extra_check(self):
         def supported(match: Match) -> bool:
             gemm = next((node for node in match.nodes if node.target is _GEMM_OP), None)
             reduce_scatter = next((node for node in match.nodes if node.target is _REDUCE_SCATTER_OP), None)
             if gemm is None or reduce_scatter is None:
-                return False
-            if _arg(gemm, 2, "bias") is not None:
                 return False
             if _arg(reduce_scatter, 1, "dim") != 0:
                 return False
@@ -102,16 +121,7 @@ class _MatmulReduceScatterPattern(BasePattern):
                 return False
             if _arg(reduce_scatter, 3, "group_name") != self.group_name:
                 return False
-            x, weight = gemm.args[0], gemm.args[1]
-            if not isinstance(x, fx.Node) or not isinstance(weight, fx.Node):
-                return False
-            x_val, weight_val = x.meta.get("val"), weight.meta.get("val")
-            if x_val is None or weight_val is None or x_val.dim() != 2 or weight_val.dim() != 2:
-                return False
-            if x_val.dtype not in _SUPPORTED_DTYPES or x_val.dtype != weight_val.dtype:
-                return False
-            reduce_dim = _static_int(x_val.shape[1])
-            return reduce_dim is not None and _MIN_REDUCE_DIM <= reduce_dim < _MAX_REDUCE_DIM_EXCLUSIVE
+            return self._check_gemm(gemm)
 
         return supported
 
@@ -265,6 +275,32 @@ class ConstantPaddedMatmulReduceScatterPattern(_MatmulReduceScatterPattern):
         return replacement
 
 
+class SPMatmulReduceScatterPattern(_MatmulReduceScatterPattern):
+    def _get_extra_check(self):
+        def supported(match: Match) -> bool:
+            gemm = next((node for node in match.nodes if node.target is _GEMM_OP), None)
+            if gemm is None:
+                return False
+            if not any(node.target is _ASCEND_SP_REDUCE_SCATTER_OP for node in match.nodes):
+                return False
+            return self._check_gemm(gemm)
+
+        return supported
+
+    def get_pattern(self):
+        def pattern(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            gemm = torch.ops.vllm.unquantized_gemm.default(x, weight, None)
+            return torch.ops.vllm.ascend_sp_reduce_scatter_impl.default(gemm)
+
+        return pattern
+
+    def get_replacement(self):
+        def replacement(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            return torch.ops.vllm.ascend_mm_reduce_scatter_padded.default(x, weight.t(), self.hcom_name, self.tp_size)
+
+        return replacement
+
+
 class MatmulReduceScatterFusionPass(VllmInductorPass):
     """Apply the padded and unpadded MMRS pattern replacements."""
 
@@ -287,6 +323,9 @@ class MatmulReduceScatterFusionPass(VllmInductorPass):
             self.pattern_match_passes
         )
         ConstantPaddedMatmulReduceScatterPattern(config, self.tp_size, self.group_name, self.hcom_name).register(
+            self.pattern_match_passes
+        )
+        SPMatmulReduceScatterPattern(config, self.tp_size, self.group_name, self.hcom_name).register(
             self.pattern_match_passes
         )
 
