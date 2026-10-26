@@ -182,14 +182,13 @@ def _make_forward_layer(layer_type: str = "full_attention", use_sp: bool = True,
 
 
 class TestSpDecoderLayerForward:
-    def test_full_attention_gathers_before_and_scatters_after(self):
+    def test_full_attention_takes_the_shard_and_scatters_after(self):
         layer = _make_forward_layer("full_attention", use_sp=True)
         hidden = torch.zeros(2, 2)
         residual = torch.zeros(2, 2)
-        gathered = torch.full((4, 2), 1.0)
 
         with (
-            patch.object(patch_qwen3_5, "sp_all_gather", return_value=gathered) as all_gather,
+            patch.object(patch_qwen3_5, "sp_all_gather", return_value=torch.full((4, 2), 1.0)) as all_gather,
             patch.object(patch_qwen3_5, "sp_reduce_scatter", side_effect=lambda x: x[:2]) as reduce_scatter,
         ):
             output, out_residual = layer.forward(
@@ -198,34 +197,39 @@ class TestSpDecoderLayerForward:
                 positions=torch.zeros(4, dtype=torch.long),
             )
 
-        # sp_all_gather runs twice per SP layer: once for attention and once
-        # for the dense MLP gather. Both start from the 2-row shard.
-        assert all_gather.call_count == 2
-        # Attention ran on the gathered full-token layout.
-        attn_input = layer.self_attn.call_args.kwargs["hidden_states"]
-        assert attn_input.shape[0] == 4
-        assert attn_input.data_ptr() == gathered.data_ptr()
-        # sp_reduce_scatter also runs twice: once after attention, once after MLP.
+        # qkv_proj all-gathers the shard itself, behind its own quantize, so
+        # the only gather left in this layer is the dense MLP's.
+        assert all_gather.call_count == 1
+        # Attention gets the 2-row shard plus the real token count.
+        attn_kwargs = layer.self_attn.call_args.kwargs
+        assert attn_kwargs["hidden_states"].data_ptr() == hidden.data_ptr()
+        assert attn_kwargs["sp_num_tokens"] == 4
+        # sp_reduce_scatter still runs twice: once after attention, once after MLP.
         assert reduce_scatter.call_count == 2
         # The final output and residual both have the shard's row count.
         assert output.shape[0] == 2
         assert out_residual.shape[0] == 2
 
-    def test_linear_attention_gathers_before_and_scatters_after(self):
+    def test_linear_attention_takes_the_shard(self):
         layer = _make_forward_layer("linear_attention", use_sp=True)
-        gathered = torch.full((4, 2), 1.0)
+        hidden = torch.zeros(2, 2)
 
         with (
-            patch.object(patch_qwen3_5, "sp_all_gather", return_value=gathered),
+            patch.object(patch_qwen3_5, "sp_all_gather", return_value=torch.full((4, 2), 1.0)) as all_gather,
             patch.object(patch_qwen3_5, "sp_reduce_scatter", side_effect=lambda x: x[:2]),
         ):
             layer.forward(
-                hidden_states=torch.zeros(2, 2),
+                hidden_states=hidden,
                 residual=torch.zeros(2, 2),
                 positions=torch.zeros(4, dtype=torch.long),
             )
 
-        assert layer.linear_attn.call_args.kwargs["hidden_states"].data_ptr() == gathered.data_ptr()
+        # Same contract as full attention: the GDN in_proj group owns the
+        # gather, so only the dense MLP gathers here.
+        attn_kwargs = layer.linear_attn.call_args.kwargs
+        assert attn_kwargs["hidden_states"].data_ptr() == hidden.data_ptr()
+        assert attn_kwargs["sp_num_tokens"] == 4
+        assert all_gather.call_count == 1
 
     def test_dense_mlp_runs_on_the_shard(self):
         layer = _make_forward_layer("full_attention", use_sp=True)
@@ -296,6 +300,9 @@ class TestSpDecoderLayerForward:
 
         all_gather.assert_not_called()
         reduce_scatter.assert_not_called()
+        # No shard, so attention gets no token count and its input projection
+        # has no collective to move behind its quantize.
+        assert layer.self_attn.call_args.kwargs["sp_num_tokens"] is None
         assert len(mlp_calls) == 1
         assert output.shape[0] == 4
         assert out_residual.shape[0] == 4
