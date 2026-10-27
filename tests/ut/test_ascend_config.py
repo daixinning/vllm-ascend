@@ -1224,6 +1224,11 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         with self.assertRaises(ValueError):
             AscendFusionConfig(unknown_key=1)
 
+    def test_ascend_fusion_config_gdn_gate_norm_defaults_off(self):
+        self.assertFalse(AscendFusionConfig().fusion_ops_gdn_gate_norm)
+        self.assertTrue(AscendFusionConfig(fusion_ops_gdn_gate_norm="true").fusion_ops_gdn_gate_norm)
+        self.assertFalse(AscendFusionConfig(fusion_ops_gdn_gate_norm="false").fusion_ops_gdn_gate_norm)
+
     def test_ascend_warmup_config_bool_lax_and_forbid(self):
         cfg = AscendWarmupConfig(enable_early_kernel_warmup="true", enable_early_nz_warmup="false")
         self.assertTrue(cfg.enable_early_kernel_warmup)

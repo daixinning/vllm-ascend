@@ -175,14 +175,24 @@ class AscendCompilationConfig:
 
 @config
 class AscendFusionConfig:
-    """Configuration for controlling whether to use a fused operator gmmswigluquant.
+    """Configuration for controlling which fused operators are used.
 
     Migrated to ``@config`` (pydantic dataclass): bool field gets lax coercion
     (``"false"``→False) and unknown keys are forbidden (``extra="forbid"``),
     fixing the ``bool("false")`` pitfall and surfacing typos.
+
+    Attributes:
+        fusion_ops_gmmswigluquant: Use the fused grouped-matmul SwiGLU quant
+            operator in the MoE path.
+        fusion_ops_gdn_gate_norm: Fuse the GDN gating kernel with the two Q/K
+            l2norm kernels into a single Triton launch
+            (``vllm_ascend/ops/triton/fused_gdn_gating_l2norm.py``). The fused
+            kernel mirrors one specific ``l2norm_fwd`` backend bit for bit and
+            is skipped when ``USE_DEFAULT_FLA_NORM`` selects another one.
     """
 
     fusion_ops_gmmswigluquant: bool = True
+    fusion_ops_gdn_gate_norm: bool = False
 
 
 @config(config=ConfigDict(frozen=True))
@@ -463,7 +473,8 @@ class AscendConfig:
                 "matmul_comm_fusion_min_tokens": 4096
             },
             "ascend_fusion_config": {
-                "fusion_ops_gmmswigluquant": true
+                "fusion_ops_gmmswigluquant": true,
+                "fusion_ops_gdn_gate_norm": false
             },
             "ascend_warmup_config": {
                 "enable_early_kernel_warmup": false,

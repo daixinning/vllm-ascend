@@ -28,8 +28,10 @@ from vllm.model_executor.model_loader.reload import (
 
 from vllm_ascend.ops.gdn import (
     _PACKED_CONV_WEIGHT_NAME,
+    _gate_norm_fusion_enabled,
     _get_base_conv1d,
     _get_packed_conv_weights,
+    _select_decode_qk,
     _split_head_first_conv_output,
     initialize_packed_conv_weight,
 )
@@ -163,3 +165,47 @@ def test_head_first_conv_split_preserves_values_and_token_axis():
             assert result.untyped_storage().data_ptr() == head_first.untyped_storage().data_ptr()
             # The public view keeps tokens on the sequence axis.
             torch.testing.assert_close(result[:, 2:], reference[:, 2:])
+
+
+def _set_gate_norm_config(monkeypatch, enabled: bool) -> None:
+    config = SimpleNamespace(ascend_fusion_config=SimpleNamespace(fusion_ops_gdn_gate_norm=enabled))
+    monkeypatch.setattr("vllm_ascend.ascend_config.get_ascend_config", lambda: config)
+
+
+def test_gate_norm_fusion_follows_config(monkeypatch):
+    _set_gate_norm_config(monkeypatch, False)
+    _gate_norm_fusion_enabled.cache_clear()
+    assert _gate_norm_fusion_enabled() is False
+
+    _set_gate_norm_config(monkeypatch, True)
+    monkeypatch.setattr("vllm_ascend.ops.gdn.fusion_matches_l2norm_backend", lambda: True)
+    _gate_norm_fusion_enabled.cache_clear()
+    assert _gate_norm_fusion_enabled() is True
+    _gate_norm_fusion_enabled.cache_clear()
+
+
+def test_select_decode_qk_prefers_split_conv_tensors():
+    tokens, heads, dim, num_decode = 6, 2, 4, 2
+    query = torch.randn(1, tokens, heads, dim)
+    key = torch.randn(1, tokens, heads, dim)
+    conv_qkv = (torch.randn(1, num_decode, heads, dim), torch.randn(1, num_decode, heads, dim), None)
+
+    # Split conv1d hands the decode rows over separately.
+    q, k = _select_decode_qk(True, conv_qkv, query, key, num_decode)
+    torch.testing.assert_close(q, conv_qkv[0])
+    torch.testing.assert_close(k, conv_qkv[1])
+
+    # Otherwise they are the leading slice, matching what section 2.2 takes.
+    q, k = _select_decode_qk(False, None, query, key, num_decode)
+    torch.testing.assert_close(q, query[:, :num_decode])
+    torch.testing.assert_close(k, key[:, :num_decode])
+
+
+def test_gate_norm_fusion_off_when_l2norm_backend_differs(monkeypatch):
+    # The fused kernel mirrors one l2norm backend bit for bit; another one
+    # must fall back instead of silently changing results.
+    _set_gate_norm_config(monkeypatch, True)
+    monkeypatch.setattr("vllm_ascend.ops.gdn.fusion_matches_l2norm_backend", lambda: False)
+    _gate_norm_fusion_enabled.cache_clear()
+    assert _gate_norm_fusion_enabled() is False
+    _gate_norm_fusion_enabled.cache_clear()
