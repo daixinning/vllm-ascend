@@ -38,6 +38,7 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, initialize_packed_conv_weight
 from vllm_ascend.ops.shared_quant_proj import project_with_shared_quant
+from vllm_ascend.patch.worker.patch_qwen3_5_gdn_split import apply_gdn_qkv_split_patch
 from vllm_ascend.utils import enable_dense_sp
 
 _GDN_PATCH_TARGET = _GDNBaseCls
@@ -331,3 +332,9 @@ else:
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels
+
+    # Last, so its __init__ wrapper chains onto the packed-weight one above.
+    # Installed unconditionally; the wrapper reads
+    # ascend_config.enable_gdn_qkv_split when a layer is built, since the
+    # config is not initialized yet at patch import time.
+    apply_gdn_qkv_split_patch()

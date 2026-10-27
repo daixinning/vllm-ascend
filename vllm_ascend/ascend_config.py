@@ -599,6 +599,11 @@ class AscendConfig:
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
+    # Split the fused Qwen3.5 GDN input projection `in_proj_qkvz` into
+    # `in_proj_qkv` + `in_proj_z`, dropping the split and reshape on the fused
+    # output at the cost of one extra matmul. Qwen3.5 only: the Qwen3-Next
+    # interleaved layout stores qkvz as one tensor that cannot be split.
+    enable_gdn_qkv_split: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
