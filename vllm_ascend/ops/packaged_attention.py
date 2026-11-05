@@ -23,8 +23,22 @@ import torch
 def _get_dsl_ops(name: str):
     """Load matching compute and metadata APIs from the operator package."""
     suffix = "_dsl" if name in ("quant_lightning_indexer", "quant_sparse_lightning_indexer") else ""
-    compute = import_module(f"ops.{name}{suffix}")
-    metadata = import_module(f"ops.{name}_metadata{suffix}")
+    candidates = [(f"ops.{name}{suffix}", f"ops.{name}_metadata{suffix}")]
+    if suffix:
+        # Native wheels keep the sample names without the historical suffix;
+        # source-tree JIT runs expose the same modules at top level.
+        candidates.extend([(f"ops.{name}", f"ops.{name}_metadata"), (name, f"{name}_metadata")])
+
+    for compute_name, metadata_name in candidates:
+        try:
+            compute = import_module(compute_name)
+            metadata = import_module(metadata_name)
+            break
+        except ModuleNotFoundError as error:
+            if error.name not in {compute_name, metadata_name}:
+                raise
+    else:
+        raise ModuleNotFoundError(f"No packaged or source-tree implementation found for {name}")
     return getattr(compute, name), getattr(metadata, f"{name}_metadata")
 
 
