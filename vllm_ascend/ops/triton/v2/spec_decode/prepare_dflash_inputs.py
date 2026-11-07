@@ -368,7 +368,7 @@ def prepare_dflash_inputs_triton(
         triton.next_power_of_2(max(2, max_ctx_per_worker)),
     )
 
-    if kv_cache_block_size % block_size != 0:
+    if cp_size > 1 and kv_cache_block_size % block_size != 0:
         raise ValueError("The physical KV block size must be divisible by the kernel block size.")
 
     _prepare_dflash_inputs_kernel[(num_reqs, workers_per_req)](
