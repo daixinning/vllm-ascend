@@ -14,12 +14,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     derive_canonical_mappings,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    get_offloading_group_ids,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.logger import logger
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -32,6 +36,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     CanonicalPageMapping,
 )
+from vllm.v1.request import Request
 
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 
@@ -160,9 +165,12 @@ class AscendOffloadingConnectorWorker(OffloadingConnectorWorker):
         ],
     ) -> None:
         kv_cache_config = self.kv_cache_config
+        selected_groups = tuple(
+            kv_cache_config.kv_cache_groups[group_id] for group_id in get_offloading_group_ids(kv_cache_config)
+        )
 
         requires_layout_adaptation = False
-        for group in kv_cache_config.kv_cache_groups:
+        for group in selected_groups:
             group_spec = group.kv_cache_spec
             per_layer_specs = group_spec.kv_cache_specs if isinstance(group_spec, UniformTypeKVCacheSpecs) else {}
             for layer_name in group.layer_names:
@@ -223,7 +231,7 @@ class AscendOffloadingConnectorWorker(OffloadingConnectorWorker):
                 )
             )
 
-        for group in kv_cache_config.kv_cache_groups:
+        for group in selected_groups:
             group_spec = group.kv_cache_spec
             per_layer_specs = group_spec.kv_cache_specs if isinstance(group_spec, UniformTypeKVCacheSpecs) else {}
             for layer_name in group.layer_names:
@@ -299,7 +307,7 @@ class AscendOffloadingConnectorWorker(OffloadingConnectorWorker):
                     raise NotImplementedError(f"Unsupported KV cache spec: {type(layer_spec).__name__}")
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
-        for group in kv_cache_config.kv_cache_groups:
+        for group in selected_groups:
             group_refs: list[CanonicalKVCacheRef] = []
             for layer_name in group.layer_names:
                 group_refs.extend(refs_by_layer[layer_name])
@@ -334,3 +342,18 @@ class AscendOffloadingConnector(OffloadingConnector):
                 vllm_config,
                 kv_cache_config,
             )
+
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
+        num_hit_tokens, load_async = super().get_num_new_matched_tokens(request, num_computed_tokens)
+        if num_hit_tokens is not None:
+            total_tokens = request.num_tokens
+            hit_rate = (num_computed_tokens + num_hit_tokens) / total_tokens if total_tokens > 0 else 0.0
+            logger.info(
+                "Request %s: total_tokens=%d, npu_hit_tokens=%d, offload_hit_tokens=%d, hit_rate=%.2f%%",
+                request.request_id,
+                total_tokens,
+                num_computed_tokens,
+                num_hit_tokens,
+                hit_rate * 100,
+            )
+        return num_hit_tokens, load_async
