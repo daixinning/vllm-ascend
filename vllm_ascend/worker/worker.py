@@ -1439,6 +1439,21 @@ class NPUWorker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner._dummy_run(num_tokens, uniform_decode=True, skip_gdn_state_update=True)
 
+    def get_kv_transfer_finished(self) -> tuple[set[str], set[str], set[str]] | None:
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        get_transfer_results = getattr(connector, "get_transfer_results", None)
+        if callable(get_transfer_results):
+            results = get_transfer_results(set())
+            return (
+                set(results.finished_sending or ()),
+                set(results.finished_recving or ()),
+                set(getattr(results, "failed_recving", None) or ()),
+            )
+        finished_sending, finished_recving = connector.get_finished(set())
+        return set(finished_sending or ()), set(finished_recving or ()), set()
+
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()

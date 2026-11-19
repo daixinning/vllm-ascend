@@ -72,6 +72,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Poll KV transfers during dummy batches and idle engine steps.
+    # "1": enable (default), "0": disable. Not sensitive.
+    "VLLM_ASCEND_ENABLE_DUMMY_KV_POLL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DUMMY_KV_POLL", "1"))),
 }
 
 # end-env-vars-definition
