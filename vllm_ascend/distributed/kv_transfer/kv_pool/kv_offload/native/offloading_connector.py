@@ -343,6 +343,10 @@ class AscendOffloadingConnector(OffloadingConnector):
                 kv_cache_config,
             )
 
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_finished(finished_req_ids)
+
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
         num_hit_tokens, load_async = super().get_num_new_matched_tokens(request, num_computed_tokens)
         if num_hit_tokens is not None:

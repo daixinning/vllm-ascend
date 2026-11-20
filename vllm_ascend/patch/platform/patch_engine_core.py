@@ -120,7 +120,8 @@ def _poll_kv_transfer_finished(engine_core) -> None:
     for result in results:
         sending, recving = result[0], result[1]
         failed = result[2] if len(result) > 2 else ()
-        if not (sending or recving or failed):
+        worker_meta = result[3] if len(result) > 3 else None
+        if not (sending or recving or failed or worker_meta):
             shims.append(_KVTransferOutputShim(None))
             continue
         shims.append(
@@ -129,6 +130,7 @@ def _poll_kv_transfer_finished(engine_core) -> None:
                     finished_sending=set(sending or ()),
                     finished_recving=set(recving or ()),
                     failed_recving=set(failed or ()),
+                    kv_connector_worker_meta=worker_meta,
                 )
             )
         )
@@ -146,6 +148,12 @@ def _poll_kv_transfer_finished(engine_core) -> None:
             kv_output.finished_sending |= worker_output.finished_sending or set()
             kv_output.finished_recving |= worker_output.finished_recving or set()
             kv_output.failed_recving |= worker_output.failed_recving or set()
+            worker_meta = worker_output.kv_connector_worker_meta
+            if worker_meta is not None:
+                current_meta = kv_output.kv_connector_worker_meta
+                kv_output.kv_connector_worker_meta = (
+                    worker_meta if current_meta is None else current_meta.aggregate(worker_meta)
+                )
     if kv_output is None:
         return
 
@@ -154,7 +162,7 @@ def _poll_kv_transfer_finished(engine_core) -> None:
     # Failed loads are also completed transfers. Keep their completion signal
     # so the scheduler can retry them or release blocks after finishing them.
     finished_recving = set(kv_output.finished_recving or ())
-    if not (finished_sending or finished_recving or failed_recving):
+    if not (finished_sending or finished_recving or failed_recving or kv_output.kv_connector_worker_meta):
         return
 
     if failed_recving:
