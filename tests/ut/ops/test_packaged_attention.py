@@ -3,10 +3,51 @@
 
 """Test packaged operator dispatcher contracts without the DSL compiler."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm_ascend.ops import packaged_attention as ops
+
+
+@pytest.mark.parametrize("name", ["quant_lightning_indexer", "quant_sparse_lightning_indexer"])
+@pytest.mark.parametrize("layout", ["legacy", "wheel", "source"])
+def test_dsl_module_layouts(monkeypatch, name, layout):
+    compute, metadata = object(), object()
+    prefix = "" if layout == "source" else "ops."
+    suffix = "_dsl" if layout == "legacy" else ""
+    modules = {
+        f"{prefix}{name}{suffix}": SimpleNamespace(**{name: compute}),
+        f"{prefix}{name}_metadata{suffix}": SimpleNamespace(**{f"{name}_metadata": metadata}),
+    }
+
+    def import_module(module_name):
+        if module_name in modules:
+            return modules[module_name]
+        missing = "ops" if layout == "source" and module_name.startswith("ops.") else module_name
+        raise ModuleNotFoundError(name=missing)
+
+    monkeypatch.setattr(ops, "import_module", import_module)
+    assert ops._get_dsl_ops.__wrapped__(name) == (compute, metadata)
+
+
+@pytest.mark.parametrize("fail_metadata", [False, True])
+def test_dsl_internal_dependency_error(monkeypatch, fail_metadata):
+    dependency_error = ModuleNotFoundError(name="dsl_compiler_dependency")
+    calls = []
+
+    def import_module(module_name):
+        calls.append(module_name)
+        if fail_metadata and len(calls) == 1:
+            return SimpleNamespace()
+        raise dependency_error
+
+    monkeypatch.setattr(ops, "import_module", import_module)
+    with pytest.raises(ModuleNotFoundError) as error:
+        ops._get_dsl_ops.__wrapped__("quant_lightning_indexer")
+    assert error.value is dependency_error
+    assert len(calls) == (2 if fail_metadata else 1)
 
 
 @pytest.mark.parametrize("return_value,candidate_blocks", [(False, -1), (True, 2048)])
