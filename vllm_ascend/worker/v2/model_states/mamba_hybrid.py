@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -332,7 +333,10 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
-        self.attn_metadata = build_attn_metadata(
+        build_metadata = build_attn_metadata
+        if self.device_metadata is not None:
+            build_metadata = partial(self.device_metadata.run_build, build_attn_metadata)
+        self.attn_metadata = build_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_actual_reqs=input_batch.num_reqs,
@@ -353,5 +357,6 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,
             for_cudagraph_capture=for_capture,
+            full_graph_mode=cudagraph_mode == CUDAGraphMode.FULL,
         )
         return self.attn_metadata
