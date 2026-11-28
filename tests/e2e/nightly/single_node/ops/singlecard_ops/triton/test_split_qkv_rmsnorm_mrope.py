@@ -2,6 +2,10 @@ import gc
 
 import pytest
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
+
+from vllm_ascend.ops.triton.linearnorm.split_qkv_rmsnorm_mrope import triton_split_qkv_rmsnorm_mrope
+from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
 NUM_TOKENS = [1, 4096]
 NUM_QKV_HEADS = [(2, 1), (16, 2)]
@@ -322,3 +326,71 @@ def test_split_qkv_rmsnorm_mrope(
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 17, 470])
+@pytest.mark.parametrize("text_positions", [False, True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("is_interleaved", [False, True])
+@torch.inference_mode()
+def test_cache_lookup_with_strided_positions(num_tokens, text_positions, cache_dtype, is_interleaved):
+    """Compare in-kernel lookup against the former Slice/Index + fused op.
+
+    Match Qwen3.6-27B TP4's head counts, gated Q layout and partial RoPE.
+    Nonzero offsets and strides cover MRV2's sliced positions buffer; text
+    positions cover its MTP path without materializing three copies.
+    """
+    device = "npu:0"
+    init_device_properties_triton()
+    torch.manual_seed(42)
+    qkv = torch.randn(num_tokens, 3584, dtype=torch.bfloat16, device=device)
+    q_weight = torch.randn(256, dtype=qkv.dtype, device=device)
+    k_weight = torch.randn_like(q_weight)
+    # A strided cache also verifies that lookup uses its real strides.
+    cache = torch.randn(1024, 128, dtype=cache_dtype, device=device)[:, ::2]
+    storage = torch.randint(-1024, 1024, (3, 2 * num_tokens + 17), device=device)
+    positions = storage[:, 5 : 5 + 2 * num_tokens : 2]
+    if text_positions:
+        positions = positions[0]
+        lookup_positions = positions.unsqueeze(0).expand(3, -1)
+    else:
+        lookup_positions = positions
+    kwargs = dict(
+        qkv=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        num_q_heads=6,
+        num_kv_heads=1,
+        head_size=256,
+        eps=1e-6,
+        mrope_section=[11, 11, 10],
+        is_interleaved=is_interleaved,
+        rope_dim=64,
+        has_gate=True,
+    )
+    expected = triton_split_qkv_rmsnorm_mrope(cos_sin=cache[lookup_positions].to(qkv.dtype), **kwargs)
+    actual = triton_split_qkv_rmsnorm_mrope(cos_sin=cache, positions=positions, **kwargs)
+    for output, reference in zip(actual, expected):
+        torch.testing.assert_close(output, reference, atol=0, rtol=0)
+
+    if num_tokens == 1 and not text_positions and cache_dtype == torch.bfloat16 and is_interleaved:
+
+        def forward(qkv, positions):
+            inputs = {**kwargs, "qkv": qkv}
+            return torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(cos_sin=cache, positions=positions, **inputs)
+
+        fx = make_fx(forward, tracing_mode="fake", _allow_non_fake_inputs=True)(qkv, positions)
+        assert "aten.index" not in fx.code and "aten.slice" not in fx.code
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            captured = forward(qkv, positions)
+        # Replay must read the current buffer, not positions/cos_sin frozen
+        # during capture. The strided positions share the original storage.
+        positions.fill_(7)
+        qkv.add_(0.25)
+        graph.replay()
+        torch.npu.synchronize()
+        expected = triton_split_qkv_rmsnorm_mrope(cos_sin=cache[positions].to(qkv.dtype), **kwargs)
+        for output, reference in zip(captured, expected):
+            torch.testing.assert_close(output, reference, atol=0, rtol=0)

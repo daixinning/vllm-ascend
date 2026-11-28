@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 
 import vllm_ascend.ops.mega_gdn_decode as mega
 
@@ -106,3 +107,48 @@ def test_bias_repack_keeps_pointer_after_reload():
     assert layer._mega_gdn_dt_bias.data_ptr() == ptr
     assert layer._mega_gdn_dt_bias.dtype == torch.float32
     assert torch.equal(layer._mega_gdn_dt_bias, torch.tensor([3.0, 3.0]))
+
+
+def test_single_token_projection_views_survive_shared_dynamic_graph(monkeypatch):
+    """Trace with multiple tokens, then run that same FX graph with one token.
+
+    This mirrors vLLM's graph reuse without allowing Dynamo to retrace and
+    hide the regression behind a separate graph specialized for one token.
+    """
+    layer = SimpleNamespace(key_dim=2048, value_dim=6144, tp_size=4, head_v_dim=128)
+    seen = []
+
+    def core(qkv, b, a, output, mega_z=None):
+        seen.append((qkv, mega_z, b, a))
+        output.copy_(mega_z)
+        return True
+
+    layer._forward_core = core
+    monkeypatch.setattr(mega, "get_forward_context", lambda: SimpleNamespace(no_compile_layers={"layer": layer}))
+    monkeypatch.setattr(mega, "get_weight_prefetch_method", lambda: None)
+
+    def forward(qkvz, ba):
+        output = qkvz.new_empty((qkvz.shape[0], 12, 128))
+        torch.ops.vllm.ascend_gdn_core_with_projection(qkvz, ba, output, "layer")
+        return output
+
+    lib = torch.library.Library("vllm", "IMPL", "CPU")
+    try:
+        if not torch._C._dispatch_has_kernel_for_dispatch_key("vllm::ascend_gdn_core_with_projection", "CPU"):
+            lib.impl("ascend_gdn_core_with_projection", mega.ascend_gdn_core_with_projection)
+        graph = make_fx(forward, tracing_mode="symbolic")(torch.empty(4, 4096), torch.empty(4, 24))
+        assert "ascend_gdn_core_with_projection" in graph.code
+        assert "ascend_split_gdn_projection" not in graph.code
+        qkvz = torch.arange(4096, dtype=torch.float32).reshape(1, 4096)
+        ba = torch.arange(24, dtype=torch.float32).reshape(1, 24)
+        output = graph(qkvz, ba)
+    finally:
+        lib._destroy()
+
+    assert len(seen) == 1
+    qkv, z, b, a = seen[0]
+    assert qkv.data_ptr() == qkvz.data_ptr()
+    assert z.data_ptr() == qkvz.data_ptr() + 2560 * qkvz.element_size()
+    assert b.data_ptr() == ba.data_ptr()
+    assert a.data_ptr() == ba.data_ptr() + 12 * ba.element_size()
+    torch.testing.assert_close(output, qkvz[:, 2560:].reshape(1, 12, 128))

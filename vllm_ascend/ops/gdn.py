@@ -477,6 +477,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     and ba.stride(-1) == 1
                     and not (self.disable_tp_for_ba_proj and self.tp_size > 1)
                 ):
+                    if mega_gdn_decode_enabled() and self.num_spec == 0:
+                        core_attn_out = torch.empty(
+                            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
+                        torch.ops.vllm.ascend_gdn_core_with_projection(mixed_qkvz, ba, core_attn_out, self.prefix)
+                        out, _ = self.out_proj(core_attn_out.flatten(-2))
+                        if output is not None:
+                            output[:num_tokens] = out
+                        return out
                     mixed_qkv, z, b, a = split_gdn_projection(mixed_qkvz, ba, qkv_size, z_size, self.head_v_dim)
                 else:
                     mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)

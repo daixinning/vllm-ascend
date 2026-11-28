@@ -33,6 +33,7 @@ def split_qkv_rmsnorm_mrope_kernel(
     k_weight_ptr: torch.Tensor,
     k_bias_ptr: torch.Tensor,
     cos_sin_ptr: torch.Tensor,
+    positions_ptr,
     out_q_ptr: torch.Tensor,
     out_k_ptr: torch.Tensor,
     out_v_ptr: torch.Tensor,
@@ -56,6 +57,12 @@ def split_qkv_rmsnorm_mrope_kernel(
     half_rope_dim: tl.constexpr,
     IS_PARTIAL_ROPE: tl.constexpr,
     gate_size: tl.constexpr,
+    LOOKUP_COS_SIN: tl.constexpr,
+    POSITION_PLANE_STRIDE: tl.constexpr,
+    POSITION_TOKEN_STRIDE: tl.constexpr,
+    CACHE_ROW_STRIDE: tl.constexpr,
+    CACHE_COLUMN_STRIDE: tl.constexpr,
+    CACHE_SIZE: tl.constexpr,
 ):
     block_idx = tl.program_id(0)
 
@@ -121,20 +128,41 @@ def split_qkv_rmsnorm_mrope_kernel(
                 cos_offsets < mrope_section_t + mrope_section_h + mrope_section_w
             )
 
-        t_cos_offset = cos_sin_ptr + (block_offset + index) * rope_dim
-        h_cos_offset = t_cos_offset + num_tokens * rope_dim
-        w_cos_offset = h_cos_offset + num_tokens * rope_dim
+        if LOOKUP_COS_SIN:
+            # Read strided positions directly: no contiguous Slice or Index
+            # kernel is needed to materialize cache[positions] first.
+            position_offset = (block_offset + index) * POSITION_TOKEN_STRIDE
+            t_pos = tl.load(positions_ptr + position_offset).to(tl.int64)
+            h_pos = tl.load(positions_ptr + POSITION_PLANE_STRIDE + position_offset).to(tl.int64)
+            w_pos = tl.load(positions_ptr + 2 * POSITION_PLANE_STRIDE + position_offset).to(tl.int64)
+            t_pos = tl.where(t_pos < 0, t_pos + CACHE_SIZE, t_pos)
+            h_pos = tl.where(h_pos < 0, h_pos + CACHE_SIZE, h_pos)
+            w_pos = tl.where(w_pos < 0, w_pos + CACHE_SIZE, w_pos)
+            t_cos_offset = cos_sin_ptr + t_pos * CACHE_ROW_STRIDE
+            h_cos_offset = cos_sin_ptr + h_pos * CACHE_ROW_STRIDE
+            w_cos_offset = cos_sin_ptr + w_pos * CACHE_ROW_STRIDE
+            cos_offsets = cos_offsets * CACHE_COLUMN_STRIDE
+            sin_offset = half_rope_dim * CACHE_COLUMN_STRIDE
+        else:
+            t_cos_offset = cos_sin_ptr + (block_offset + index) * rope_dim
+            h_cos_offset = t_cos_offset + num_tokens * rope_dim
+            w_cos_offset = h_cos_offset + num_tokens * rope_dim
+            sin_offset = half_rope_dim
 
-        t_sin_offset = cos_sin_ptr + (block_offset + index) * rope_dim + half_rope_dim
-        h_sin_offset = t_sin_offset + num_tokens * rope_dim
-        w_sin_offset = h_sin_offset + num_tokens * rope_dim
-
-        t_cos_tensor = tl.load(t_cos_offset + cos_offsets, mask=t_mask, other=0)
-        h_cos_tensor = tl.load(h_cos_offset + cos_offsets, mask=h_mask, other=0)
-        w_cos_tensor = tl.load(w_cos_offset + cos_offsets, mask=w_mask, other=0)
-        t_sin_tensor = tl.load(t_sin_offset + cos_offsets, mask=t_mask, other=0)
-        h_sin_tensor = tl.load(h_sin_offset + cos_offsets, mask=h_mask, other=0)
-        w_sin_tensor = tl.load(w_sin_offset + cos_offsets, mask=w_mask, other=0)
+        # Match the former cache[positions].to(qkv.dtype) rounding even if the
+        # original cache is FP32. Conversion stays inside this kernel.
+        t_cos_tensor = tl.load(t_cos_offset + cos_offsets, mask=t_mask, other=0).to(in_qkv_ptr.dtype.element_ty)
+        h_cos_tensor = tl.load(h_cos_offset + cos_offsets, mask=h_mask, other=0).to(in_qkv_ptr.dtype.element_ty)
+        w_cos_tensor = tl.load(w_cos_offset + cos_offsets, mask=w_mask, other=0).to(in_qkv_ptr.dtype.element_ty)
+        t_sin_tensor = tl.load(t_cos_offset + sin_offset + cos_offsets, mask=t_mask, other=0).to(
+            in_qkv_ptr.dtype.element_ty
+        )
+        h_sin_tensor = tl.load(h_cos_offset + sin_offset + cos_offsets, mask=h_mask, other=0).to(
+            in_qkv_ptr.dtype.element_ty
+        )
+        w_sin_tensor = tl.load(w_cos_offset + sin_offset + cos_offsets, mask=w_mask, other=0).to(
+            in_qkv_ptr.dtype.element_ty
+        )
 
         cos_tensor = (t_cos_tensor + h_cos_tensor + w_cos_tensor).to(tl.float32).reshape(1, half_rope_dim)
         cos_tensor = tl.broadcast_to(cos_tensor, (2, half_rope_dim)).reshape(1, rope_dim)
@@ -296,6 +324,7 @@ def triton_split_qkv_rmsnorm_mrope(
     has_gate: bool = False,
     o_proj_weight: torch.Tensor | None = None,
     o_proj_ratio: float = 0.0,
+    positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     core_num = get_vectorcore_num()
 
@@ -333,6 +362,16 @@ def triton_split_qkv_rmsnorm_mrope(
 
     has_bias = q_bias is not None
 
+    if positions is not None:
+        if positions.ndim not in (1, 2) or (positions.ndim == 2 and positions.shape[0] != 3):
+            raise ValueError("positions must have shape [tokens] or [3, tokens]")
+        if positions.shape[-1] < num_tokens:
+            raise ValueError("positions must contain at least num_tokens entries per plane")
+        if positions.device != qkv.device or cos_sin.device != qkv.device:
+            raise ValueError("positions, cos_sin cache and qkv must be on the same device")
+        if cos_sin.ndim != 2 or cos_sin.shape[1] != rope_dim:
+            raise ValueError("cos_sin cache must have shape [max_position, rope_dim]")
+
     split_qkv_rmsnorm_mrope_kernel[(block_dim,)](
         qkv,
         q_weight,
@@ -340,6 +379,7 @@ def triton_split_qkv_rmsnorm_mrope(
         k_weight,
         k_bias,
         cos_sin,
+        positions,
         q_output,
         k_output,
         v_output,
@@ -363,6 +403,12 @@ def triton_split_qkv_rmsnorm_mrope(
         rope_dim // 2,
         IS_PARTIAL_ROPE,
         gate_size,
+        positions is not None,
+        positions.stride(0) if positions is not None and positions.ndim == 2 else 0,
+        positions.stride(-1) if positions is not None else 0,
+        cos_sin.stride(0) if positions is not None else 0,
+        cos_sin.stride(1) if positions is not None else 1,
+        cos_sin.shape[0] if positions is not None else 0,
     )
     if o_proj_weight is not None and o_proj_ratio > 0:
         # Fork o_proj's prefetch here, inside this mutating op, so compilation
@@ -395,6 +441,7 @@ def triton_split_qkv_rmsnorm_mrope_fake(
     has_gate: bool = False,
     o_proj_weight: torch.Tensor | None = None,
     o_proj_ratio: float = 0.0,
+    positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = qkv.shape[0]
     q_size = num_q_heads * head_size

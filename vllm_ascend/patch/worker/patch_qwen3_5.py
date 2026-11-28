@@ -83,20 +83,13 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
         if "qwen3_5" not in self.config.model_type or not self.attn_output_gate:
             o_proj_ratio = 0.0
         if _uses_multimodal_rope(self):
-            # MRV2 MTP uses 1D text positions; the fused kernel reads three planes.
-            if positions.ndim == 1:
-                positions = positions.unsqueeze(0).expand(3, -1)
-            cos_sin = self.rotary_emb.cos_sin_cache[positions]
-            if cos_sin.device != qkv.device:
-                cos_sin = cos_sin.to(qkv.device)
-            if cos_sin.dtype != qkv.dtype:
-                cos_sin = cos_sin.to(qkv.dtype)
-
+            # The kernel reads raw (possibly strided or 1D MTP) positions and
+            # gathers the cache itself, avoiding separate Slice/Index kernels.
             q, k, v, gate = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
                 qkv=qkv,
                 q_weight=gemma_norm_weight(self.q_norm),
                 k_weight=gemma_norm_weight(self.k_norm),
-                cos_sin=cos_sin,
+                cos_sin=self.rotary_emb.cos_sin_cache,
                 num_q_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,
@@ -107,6 +100,7 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
                 has_gate=self.attn_output_gate,
                 o_proj_weight=self.o_proj.weight if o_proj_ratio > 0 else None,
                 o_proj_ratio=o_proj_ratio,
+                positions=positions,
             )
         else:
             if self.attn_output_gate:

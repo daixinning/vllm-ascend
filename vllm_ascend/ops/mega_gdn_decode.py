@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ops.triton.fla.split_gdn_projection import split_gdn_projection
 from vllm_ascend.utils import bootstrap_custom_op_env, get_weight_prefetch_method, is_950
 
 HEAD_DIM = 128
@@ -316,4 +317,34 @@ direct_register_custom_op(
     op_func=ascend_gdn_core_with_norm,
     mutates_args=["output"],
     fake_impl=_ascend_gdn_core_with_norm_fake,
+)
+
+
+def ascend_gdn_core_with_projection(
+    qkvz: torch.Tensor, ba: torch.Tensor, output: torch.Tensor, layer_name: str
+) -> None:
+    """Split inside the opaque core, where token counts are concrete.
+
+    A Python single-token branch outside this op is lost when Dynamo traces
+    the multi-token path for vLLM's shared dynamic graph. Keeping the views
+    internal also avoids exposing aliased custom-op outputs to functionalization.
+    """
+    layer = get_forward_context().no_compile_layers[layer_name]
+    qkv_dim = (2 * layer.key_dim + layer.value_dim) // layer.tp_size
+    z_dim = layer.value_dim // layer.tp_size
+    qkv, z, b, a = split_gdn_projection(qkvz, ba, qkv_dim, z_dim, layer.head_v_dim)
+    ascend_gdn_core_with_norm(qkv, z, b, a, output, layer_name)
+
+
+def _ascend_gdn_core_with_projection_fake(
+    qkvz: torch.Tensor, ba: torch.Tensor, output: torch.Tensor, layer_name: str
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="ascend_gdn_core_with_projection",
+    op_func=ascend_gdn_core_with_projection,
+    mutates_args=["output"],
+    fake_impl=_ascend_gdn_core_with_projection_fake,
 )
