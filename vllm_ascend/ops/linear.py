@@ -101,8 +101,8 @@ def _should_reshape_wo_a_to_3d(prefix: str, dtype: torch.dtype) -> bool:
 
 logger = init_logger(__name__)
 
-# Gate outcomes per linear prefix, filled at trace time. Read it from outside
-# the compiled region: logger calls inside forward are untraceable.
+# Gate outcomes from eager execution only. Mutating this dict while tracing
+# emits an update in Dynamo bytecode and trips vLLM's graph safety check.
 PREFETCH_PROBE: dict[str, str] = {}
 
 
@@ -405,7 +405,9 @@ class AscendRowParallelLinear(RowParallelLinear):
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
 
-        if not (self.reduce_results and self.tp_size > 1 and self.input_is_parallel):
+        if not torch.compiler.is_compiling() and not (
+            self.reduce_results and self.tp_size > 1 and self.input_is_parallel
+        ):
             PREFETCH_PROBE[self.prefix] = (
                 f"OUTER_FAIL reduce={self.reduce_results} tp={self.tp_size} in_par={self.input_is_parallel}"
             )
@@ -420,7 +422,8 @@ class AscendRowParallelLinear(RowParallelLinear):
             from vllm_ascend.ops.mlp_weight_prefetch import _all_reduce_prefetch_target
 
             _probe_target = _all_reduce_prefetch_target(self.prefix)
-            PREFETCH_PROBE[self.prefix] = "HIT" if _probe_target is not None else "MISS"
+            if not torch.compiler.is_compiling():
+                PREFETCH_PROBE[self.prefix] = "HIT" if _probe_target is not None else "MISS"
             if _probe_target is not None:
                 bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
                 output_parallel = self.quant_method.apply(self, input_, bias_)
