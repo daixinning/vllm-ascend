@@ -642,10 +642,11 @@ class AscendConfig:
     # regressed decode by ~0.2ms; the fused matmul has no streams/events.
     # Field name kept for compatibility with existing deployment configs.
     #
-    # Costs one extra copy of the qkv(z) weight per GDN layer (~42MB at
-    # TP4, ~2GB/rank over 48 layers). Falls back silently to the original
-    # serial path on quantized / LoRA / interleaved / bias layouts, and
-    # composes with enable_gdn_qkv_split (ba fuses into in_proj_qkv).
+    # With enable_gdn_qkv_split=False, one GEMM computes [QKVZ | BA].
+    # With it enabled, one GEMM computes [QKV | BA] and Z stays separate.
+    # Source weights share the fused allocation when rebinding succeeds;
+    # otherwise an extra fused copy is retained. Unsupported quantized,
+    # LoRA, interleaved and bias layouts keep their original projection path.
     #
     #   --additional-config '{"enable_gdn_ba_overlap_stream": true}'
     enable_gdn_ba_overlap_stream: bool = False

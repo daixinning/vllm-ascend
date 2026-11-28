@@ -246,8 +246,8 @@ def _fused_ba_inputs(
     attn,
     hidden_states: torch.Tensor,
     sp_num_tokens: int | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One GEMM for the qkv(z) projection and ba, then split the outputs.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One GEMM for qkv(z) and ba, returning raw views for the layout splitter.
 
     The fused weight has exactly ``main_cols + ba_cols`` rows (4120 at TP4),
     so a single 2-way ``split`` (views, no extra kernel) hands the rest of
@@ -264,8 +264,9 @@ def _fused_ba_inputs(
         hidden_states = sp_all_gather(hidden_states)[:sp_num_tokens]
     fused = torch.nn.functional.linear(hidden_states, attn._fused_qkvz_ba_w)
     main, ba = fused.split([attn._main_cols, attn._ba_cols], dim=-1)
-    b, a = attn._split_ba_for_tp(ba)
-    return hidden_states, main, b.contiguous(), a.contiguous()
+    # Keep the shared row stride: split_gdn_projection accepts strided inputs
+    # and packs QKV, Z, B and A together, including multi-token batches.
+    return hidden_states, main, ba
 
 
 @lru_cache(maxsize=1)
@@ -627,21 +628,23 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens = sp_num_tokens if sp_num_tokens is not None else hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
             if getattr(self, "_ba_fused", False):
-                hidden_states, mixed_qkv, b, a = _fused_ba_inputs(
-                    self, hidden_states, sp_num_tokens
-                )
+                hidden_states, mixed_qkv, ba = _fused_ba_inputs(self, hidden_states, sp_num_tokens)
                 z = self.in_proj_z(hidden_states)[0]
             else:
                 mixed_qkv, ba, z = project_with_shared_quant(
                     self, hidden_states, ("in_proj_qkv", "in_proj_ba", "in_proj_z"), sp_num_tokens
                 )
-                b, a = self._split_ba_for_tp(ba)
-                b = b.contiguous()
-                a = a.contiguous()
+            b, a = self._split_ba_for_tp(ba)
+            b = b.contiguous()
+            a = a.contiguous()
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:
             if not self.gqa_interleaved_layout:
-                if sp_num_tokens is None and can_overlap_gdn_qkvz_ba(self, hidden_states):
+                if getattr(self, "_ba_fused", False):
+                    # With qkv splitting disabled this is one [QKVZ | BA]
+                    # GEMM. Prefer it over the legacy two-projection overlap.
+                    hidden_states, mixed_qkvz, ba = _fused_ba_inputs(self, hidden_states, sp_num_tokens)
+                elif sp_num_tokens is None and can_overlap_gdn_qkvz_ba(self, hidden_states):
                     mixed_qkvz, ba = torch.ops.vllm.ascend_gdn_qkvz_ba_projection(
                         hidden_states, self.in_proj_qkvz.weight, self.in_proj_ba.weight, self.prefix
                     )
