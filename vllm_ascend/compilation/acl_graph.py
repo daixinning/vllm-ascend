@@ -246,7 +246,6 @@ class ACLGraphWrapper:
             if self.enable_super_kernel:
                 aclgraph.super_kernel_optimize(
                     optimize_options={
-                        "dcci_after_kernel_end": [".*"],
                     },
                 )
                 logger.info_once("Super kernel optimization is enabled for ACL graph capture.")

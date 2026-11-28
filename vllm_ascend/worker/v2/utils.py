@@ -204,7 +204,6 @@ def torch_npu_graph_wrapper(*args, **kwargs):
         if enable_super_kernel and graph is not None:
             graph.super_kernel_optimize(
                 optimize_options={
-                    "dcci_after_kernel_end": [".*"],
                 },
             )
             logger.info_once("Super kernel optimization is enabled for ACL graph capture.")

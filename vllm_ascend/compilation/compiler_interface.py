@@ -155,7 +155,6 @@ def _configure_backend(
             if ascend_compilation_config.enable_super_kernel:
                 options["super_kernel_optimize"] = True
                 options["super_kernel_optimize_options"] = {
-                    "dcci_after_kernel_end": [".*"],
                 }
         process_kwargs_options(config, {"options": options})
     else:
